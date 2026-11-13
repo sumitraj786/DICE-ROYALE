@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "Dice Royale",
+    "slug": "dice-royale",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.diceroyale.app"
+    },
+    "android": {
+      "package": "com.diceroyale.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#0B291E"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}

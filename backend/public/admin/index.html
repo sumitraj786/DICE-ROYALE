@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dice Royale — Admin Control Center</title>
+  <link rel="stylesheet" href="admin.css" />
+</head>
+<body>
+  <!-- Login Overlay -->
+  <div id="login-overlay" class="login-overlay">
+    <div class="login-card">
+      <div class="brand-badge">DICE ROYALE</div>
+      <h1>Admin Control Center</h1>
+      <p class="muted">Authorized administrators only</p>
+      <form id="admin-login-form">
+        <label>Admin Login ID</label>
+        <input type="text" id="login-id" value="admin" required />
+        <label>Password</label>
+        <input type="password" id="login-pass" placeholder="Enter admin password" required />
+        <button type="submit" class="btn-primary">Sign In</button>
+        <p id="login-error" class="error-text"></p>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main Admin Shell -->
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span class="logo-dot"></span>
+        <div>
+          <div class="logo-title">DICE ROYALE</div>
+          <div class="logo-sub">Admin Panel</div>
+        </div>
+      </div>
+      <nav class="nav-list">
+        <button class="nav-item active" data-tab="dashboard">Dashboard</button>
+        <button class="nav-item" data-tab="players">Players</button>
+        <button class="nav-item" data-tab="create-player">Create Player</button>
+        <button class="nav-item" data-tab="online-users">Online Users</button>
+        <button class="nav-item" data-tab="game-tables">Game Tables</button>
+        <button class="nav-item" data-tab="bets-games">Bets and Games</button>
+        <button class="nav-item" data-tab="transactions">Transactions</button>
+        <button class="nav-item" data-tab="login-logs">Login Logs</button>
+        <button class="nav-item" data-tab="wallet-adjustments">Wallet Adjustments</button>
+        <button class="nav-item" data-tab="audit-logs">Audit Logs</button>
+        <button class="nav-item" data-tab="settings">Settings</button>
+      </nav>
+      <button id="logout-btn" class="btn-logout">Sign Out</button>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <h2 id="page-title">Dashboard</h2>
+        <div class="topbar-actions">
+          <button id="refresh-btn" class="btn-secondary">Refresh Data</button>
+        </div>
+      </header>
+      <div id="tab-content" class="tab-content"></div>
+    </main>
+  </div>
+
+  <script src="admin.js"></script>
+</body>
+</html>
