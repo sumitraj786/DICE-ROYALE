@@ -222,6 +222,15 @@ async function renderTab(tab) {
             <button type="submit" class="btn-primary">Create Room</button>
             <p id="rm-msg" class="muted" style="margin-top:10px;"></p>
           </form>
+        </div>
+        <div class="panel form-grid">
+          <h3>Change Admin Password</h3>
+          <form id="admin-pass-form">
+            <label>Current Password</label><input id="ap-cur" type="password" required />
+            <label>New Password (min 6 chars)</label><input id="ap-new" type="password" minlength="6" required />
+            <button type="submit" class="btn-primary">Update Admin Password</button>
+            <p id="ap-msg" class="muted" style="margin-top:10px;"></p>
+          </form>
         </div>`;
       document.getElementById('room-form').addEventListener('submit', async (e) => {
         e.preventDefault();
@@ -237,6 +246,25 @@ async function renderTab(tab) {
           });
           msg.textContent = 'Room created!';
           msg.style.color = '#10b981';
+        } catch (err) {
+          msg.textContent = err.message;
+          msg.style.color = '#ef4444';
+        }
+      });
+      document.getElementById('admin-pass-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const msg = document.getElementById('ap-msg');
+        try {
+          await api('/api/auth/change-password', {
+            method: 'POST',
+            body: JSON.stringify({
+              currentPassword: document.getElementById('ap-cur').value,
+              newPassword: document.getElementById('ap-new').value,
+            }),
+          });
+          msg.textContent = 'Admin password updated! Use the new password next time you sign in.';
+          msg.style.color = '#10b981';
+          document.getElementById('admin-pass-form').reset();
         } catch (err) {
           msg.textContent = err.message;
           msg.style.color = '#ef4444';
