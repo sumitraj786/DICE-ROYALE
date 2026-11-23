@@ -26,6 +26,18 @@ export default function App() {
   const [countdownSec, setCountdownSec] = useState(null);
   const [showRules, setShowRules] = useState(false);
   const [bannerMsg, setBannerMsg] = useState('');
+
+  // Two-dice rolling animation state
+  const [isRolling, setIsRolling] = useState(false);
+  const [lastRoll, setLastRoll] = useState(null);
+
+  // Withdrawal request modal state
+  const [showWithdrawModal, setShowWithdrawModal] = useState(false);
+  const [withdrawAmount, setWithdrawAmount] = useState('');
+  const [withdrawNote, setWithdrawNote] = useState('');
+  const [myWithdrawals, setMyWithdrawals] = useState([]);
+  const [isSubmittingWithdraw, setIsSubmittingWithdraw] = useState(false);
+
   const socketRef = useRef(null);
 
   async function apiFetch(path, opts = {}) {
@@ -36,7 +48,29 @@ export default function App() {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
     });
-    const data = await res.json();
+    const text = await res.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(`Server returned non-JSON response (${res.status}). Check API_BASE_URL.`);
+    }
+
+    // Handle session termination / forced logout from another device
+    if (res.status === 401) {
+      if (token) {
+        setToken(null);
+        setUser(null);
+        setRoomState(null);
+        if (socketRef.current) socketRef.current.disconnect();
+        Alert.alert(
+          'Session Expired',
+          data.error || 'You were logged out because your account signed in on another device.'
+        );
+      }
+      throw new Error(data.error || 'Authentication required');
+    }
+
     if (!res.ok) throw new Error(data.error || 'Request failed');
     return data;
   }
@@ -45,10 +79,13 @@ export default function App() {
     try {
       const data = await apiFetch('/api/auth/login', {
         method: 'POST',
-        body: JSON.stringify({ loginId, password }),
+        body: JSON.stringify({ loginId: loginId.trim(), password }),
       });
-      setToken(data.token);
+      if (!data?.token || !data?.user) {
+        throw new Error('Invalid login response from server.');
+      }
       setUser(data.user);
+      setToken(data.token);
     } catch (err) {
       Alert.alert('Login Failed', err.message);
     }
@@ -67,10 +104,55 @@ export default function App() {
     }
   };
 
+  const fetchWithdrawals = async () => {
+    try {
+      const list = await apiFetch('/api/withdrawals/me');
+      if (Array.isArray(list)) setMyWithdrawals(list);
+    } catch {}
+  };
+
+  const handleWithdrawSubmit = async () => {
+    const amt = parseInt(withdrawAmount, 10);
+    if (isNaN(amt) || amt <= 0) {
+      return Alert.alert('Invalid Amount', 'Please enter a valid positive coin amount.');
+    }
+    const currentAvail = user?.availableBalance ?? 0;
+    if (amt > currentAvail) {
+      return Alert.alert('Insufficient Balance', `You can withdraw at most ${currentAvail} coins.`);
+    }
+
+    try {
+      setIsSubmittingWithdraw(true);
+      await apiFetch('/api/withdrawals', {
+        method: 'POST',
+        body: JSON.stringify({ amount: amt, note: withdrawNote }),
+      });
+      setWithdrawAmount('');
+      setWithdrawNote('');
+      Alert.alert('Request Submitted', 'Your withdrawal request has been submitted for admin approval.');
+
+      // Refresh player wallet balance and withdrawal history
+      const me = await apiFetch('/api/me');
+      if (me) {
+        setUser((prev) => ({
+          ...prev,
+          availableBalance: me.available_balance,
+          reservedBalance: me.reserved_balance,
+        }));
+      }
+      fetchWithdrawals();
+    } catch (err) {
+      Alert.alert('Withdrawal Failed', err.message);
+    } finally {
+      setIsSubmittingWithdraw(false);
+    }
+  };
+
   useEffect(() => {
-    if (!token || user?.mustChangePassword) return;
+    if (!token || !user || user.mustChangePassword) return;
 
     apiFetch('/api/rooms').then(setRooms).catch(() => {});
+    fetchWithdrawals();
 
     const socket = io(SOCKET_URL, { auth: { token } });
     socketRef.current = socket;
@@ -79,9 +161,38 @@ export default function App() {
       setRoomState(state);
     });
 
+    // Synchronized dice roll result across both players and all spectators
+    socket.on('game:roll_result', (rollRecord) => {
+      setIsRolling(true);
+      setLastRoll(rollRecord);
+      setTimeout(() => {
+        setIsRolling(false);
+      }, 700);
+    });
+
     socket.on('game:matchup_settled', (res) => {
       setBannerMsg(`Matchup settled! Winner takes ${res.pot} coins.`);
+      if (res.finalRoll) setLastRoll(res.finalRoll);
       setTimeout(() => setBannerMsg(''), 4000);
+    });
+
+    socket.on('table:notice', (data) => {
+      if (data?.message) {
+        setBannerMsg(data.message);
+        setTimeout(() => setBannerMsg(''), 5000);
+      }
+    });
+
+    // Forced logout when logged in on another device/tab
+    socket.on('session:force_logout', (data) => {
+      setToken(null);
+      setUser(null);
+      setRoomState(null);
+      socket.disconnect();
+      Alert.alert(
+        'Session Terminated',
+        data?.message || 'You were logged out because your account signed in on another device.'
+      );
     });
 
     socket.on('error:msg', (err) => {
@@ -109,7 +220,13 @@ export default function App() {
     return () => clearInterval(timer);
   }, [roomState?.countdownDeadline]);
 
-  if (!token) {
+  const handleRoll = (roomId) => {
+    if (isRolling) return;
+    setIsRolling(true);
+    socketRef.current.emit('game:roll', { roomId });
+  };
+
+  if (!token || !user) {
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.card}>
@@ -140,7 +257,7 @@ export default function App() {
     );
   }
 
-  if (user?.mustChangePassword) {
+  if (user.mustChangePassword) {
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.card}>
@@ -203,17 +320,23 @@ export default function App() {
             pendingMatchup={pendingMatchup}
             countdownSec={countdownSec}
             currentUserId={user.id}
+            isRolling={isRolling}
+            lastRoll={lastRoll}
           />
 
           {/* Controls */}
           {activeMatchup ? (
             <TouchableOpacity
-              style={[styles.rollBtn, !isMyTurn && styles.btnDisabled]}
-              disabled={!isMyTurn}
-              onPress={() => socketRef.current.emit('game:roll', { roomId: room.id })}
+              style={[styles.rollBtn, (!isMyTurn || isRolling) && styles.btnDisabled]}
+              disabled={!isMyTurn || isRolling}
+              onPress={() => handleRoll(room.id)}
             >
               <Text style={styles.rollBtnText}>
-                {isMyTurn ? 'ROLL TWO DICE' : 'Waiting for Opponent...'}
+                {isRolling
+                  ? 'ROLLING DICE...'
+                  : isMyTurn
+                  ? 'ROLL TWO DICE'
+                  : 'Waiting for Opponent...'}
               </Text>
             </TouchableOpacity>
           ) : amInPending ? (
@@ -277,16 +400,35 @@ export default function App() {
         <View style={styles.topBar}>
           <View>
             <Text style={styles.brand}>DICE ROYALE</Text>
-            <Text style={styles.subtitle}>Welcome, {user.displayName}</Text>
+            <Text style={styles.subtitle}>Welcome, {user?.displayName || 'Player'}</Text>
           </View>
           <TouchableOpacity onPress={() => { setToken(null); setUser(null); }}>
             <Text style={{ color: '#EF4444', fontWeight: '700' }}>Logout</Text>
           </TouchableOpacity>
         </View>
 
+        {/* Wallet Card with Withdraw Button */}
         <View style={styles.walletCard}>
-          <Text style={styles.walletLabel}>Available Balance</Text>
-          <Text style={styles.walletVal}>{user.availableBalance} 🪙</Text>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+            <View>
+              <Text style={styles.walletLabel}>Available Balance</Text>
+              <Text style={styles.walletVal}>{user?.availableBalance ?? 0} 🪙</Text>
+              {Boolean(user?.reservedBalance) && (
+                <Text style={{ color: '#9CA3AF', fontSize: 12, marginTop: 2 }}>
+                  ({user.reservedBalance} 🪙 in-play / pending)
+                </Text>
+              )}
+            </View>
+            <TouchableOpacity
+              style={styles.btnWithdraw}
+              onPress={() => {
+                setShowWithdrawModal(true);
+                fetchWithdrawals();
+              }}
+            >
+              <Text style={styles.btnWithdrawText}>Withdraw</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         <Text style={styles.sectionTitle}>Private Gaming Rooms</Text>
@@ -304,6 +446,106 @@ export default function App() {
           </TouchableOpacity>
         ))}
       </ScrollView>
+
+      {/* Coin Withdrawal Modal */}
+      <Modal visible={showWithdrawModal} transparent animationType="slide">
+        <View style={styles.modalBg}>
+          <View style={[styles.card, { maxHeight: '88%' }]}>
+            <Text style={styles.brand}>Coin Withdrawal</Text>
+            <Text style={styles.subtitle}>
+              Available Balance: {user?.availableBalance ?? 0} 🪙
+            </Text>
+
+            <TextInput
+              style={styles.input}
+              placeholder="Coin Amount to withdraw"
+              placeholderTextColor="#6B7280"
+              keyboardType="numeric"
+              value={withdrawAmount}
+              onChangeText={setWithdrawAmount}
+            />
+
+            <TextInput
+              style={styles.input}
+              placeholder="Payout Note (UPI ID / Bank details / notes)"
+              placeholderTextColor="#6B7280"
+              value={withdrawNote}
+              onChangeText={setWithdrawNote}
+            />
+
+            <TouchableOpacity
+              style={[styles.btnPrimary, isSubmittingWithdraw && styles.btnDisabled]}
+              disabled={isSubmittingWithdraw}
+              onPress={handleWithdrawSubmit}
+            >
+              <Text style={styles.btnText}>
+                {isSubmittingWithdraw ? 'Submitting...' : 'Submit Withdrawal Request'}
+              </Text>
+            </TouchableOpacity>
+
+            <Text style={[styles.sectionTitle, { marginTop: 18, marginBottom: 8 }]}>
+              Recent Withdrawal Requests
+            </Text>
+
+            <ScrollView style={{ maxHeight: 180 }}>
+              {myWithdrawals.length === 0 ? (
+                <Text style={styles.note}>No withdrawal requests yet.</Text>
+              ) : (
+                myWithdrawals.map((w) => (
+                  <View key={w.id} style={styles.historyRow}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: '#D4AF37', fontWeight: '700', fontSize: 14 }}>
+                        {w.amount} 🪙
+                      </Text>
+                      {Boolean(w.note) && (
+                        <Text style={{ color: '#9CA3AF', fontSize: 11 }} numberOfLines={1}>
+                          {w.note}
+                        </Text>
+                      )}
+                      {Boolean(w.admin_reason) && (
+                        <Text style={{ color: '#FCA5A5', fontSize: 11 }}>
+                          Reason: {w.admin_reason}
+                        </Text>
+                      )}
+                      <Text style={{ color: '#6B7280', fontSize: 10 }}>{w.created_at}</Text>
+                    </View>
+                    <View
+                      style={[
+                        styles.statusBadge,
+                        w.status === 'approved'
+                          ? styles.badgeApproved
+                          : w.status === 'rejected'
+                          ? styles.badgeRejected
+                          : styles.badgePending,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.statusBadgeText,
+                          w.status === 'approved'
+                            ? styles.textApproved
+                            : w.status === 'rejected'
+                            ? styles.textRejected
+                            : styles.textPending,
+                        ]}
+                      >
+                        {w.status.toUpperCase()}
+                      </Text>
+                    </View>
+                  </View>
+                ))
+              )}
+            </ScrollView>
+
+            <TouchableOpacity
+              style={[styles.btnSmall, { marginTop: 14, alignSelf: 'center' }]}
+              onPress={() => setShowWithdrawModal(false)}
+            >
+              <Text style={styles.btnSmallText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -323,6 +565,16 @@ const styles = StyleSheet.create({
   walletCard: { backgroundColor: '#121A17', borderWidth: 1, borderColor: '#D4AF37', borderRadius: 14, padding: 18, marginBottom: 20 },
   walletLabel: { color: '#9CA3AF', fontSize: 12 },
   walletVal: { color: '#D4AF37', fontSize: 28, fontWeight: '900', marginTop: 4 },
+  btnWithdraw: {
+    backgroundColor: 'rgba(212,175,55,0.18)',
+    borderWidth: 1,
+    borderColor: '#D4AF37',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignSelf: 'center',
+  },
+  btnWithdrawText: { color: '#D4AF37', fontWeight: '800', fontSize: 13 },
   sectionTitle: { color: '#F9FAFB', fontSize: 16, fontWeight: '700', marginBottom: 10 },
   roomCard: { backgroundColor: '#121A17', borderWidth: 1, borderColor: '#23332D', borderRadius: 12, padding: 16, marginBottom: 10, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   roomTitle: { color: '#F9FAFB', fontSize: 16, fontWeight: '700' },
@@ -341,4 +593,24 @@ const styles = StyleSheet.create({
   bannerText: { color: '#10B981', fontWeight: '700', textAlign: 'center' },
   modalBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.75)', justifyContent: 'center' },
   ruleText: { color: '#E5E7EB', fontSize: 14, marginBottom: 8 },
+  historyRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1E2A25',
+  },
+  statusBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  badgePending: { backgroundColor: 'rgba(212,175,55,0.18)' },
+  badgeApproved: { backgroundColor: 'rgba(16,185,129,0.18)' },
+  badgeRejected: { backgroundColor: 'rgba(239,68,68,0.18)' },
+  statusBadgeText: { fontSize: 11, fontWeight: '800' },
+  textPending: { color: '#D4AF37' },
+  textApproved: { color: '#10B981' },
+  textRejected: { color: '#EF4444' },
 });

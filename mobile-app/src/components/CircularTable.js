@@ -1,5 +1,5 @@
-import React from 'react';
-import { View, Text, StyleSheet, Dimensions } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { View, Text, StyleSheet, Dimensions, Animated, Easing } from 'react-native';
 
 const { width } = Dimensions.get('window');
 const TABLE_SIZE = Math.min(width - 36, 360);
@@ -11,13 +11,61 @@ export default function CircularTable({
   pendingMatchup,
   countdownSec,
   currentUserId,
+  isRolling = false,
+  lastRoll,
 }) {
   const matchup = activeMatchup || pendingMatchup;
+  const spinAnim = useRef(new Animated.Value(0)).current;
+  const [rollingD1, setRollingD1] = useState(1);
+  const [rollingD2, setRollingD2] = useState(6);
+
+  useEffect(() => {
+    let cycleInterval;
+    if (isRolling) {
+      // Rapid cycling of dice numbers every 60ms
+      cycleInterval = setInterval(() => {
+        setRollingD1(Math.floor(Math.random() * 6) + 1);
+        setRollingD2(Math.floor(Math.random() * 6) + 1);
+      }, 60);
+
+      spinAnim.setValue(0);
+      Animated.timing(spinAnim, {
+        toValue: 1,
+        duration: 700,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    } else {
+      spinAnim.setValue(0);
+    }
+    return () => {
+      if (cycleInterval) clearInterval(cycleInterval);
+    };
+  }, [isRolling]);
+
+  const spin1 = spinAnim.interpolate({
+    inputRange: [0, 0.25, 0.5, 0.75, 1],
+    outputRange: ['0deg', '180deg', '360deg', '540deg', '720deg'],
+  });
+
+  const spin2 = spinAnim.interpolate({
+    inputRange: [0, 0.25, 0.5, 0.75, 1],
+    outputRange: ['0deg', '-180deg', '-360deg', '-540deg', '-720deg'],
+  });
+
+  const scaleAnim = spinAnim.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: [1, 1.25, 1],
+  });
 
   const getPlayerName = (id) => {
     const found = seats.find((s) => s.playerId === id);
     return found ? found.displayName : 'Player';
   };
+
+  const rollToDisplay = isRolling
+    ? { d1: rollingD1, d2: rollingD2 }
+    : (activeMatchup?.lastRoll || lastRoll);
 
   return (
     <View style={styles.wrapper}>
@@ -44,28 +92,6 @@ export default function CircularTable({
                         </Text>
                       </View>
                     )}
-                    {activeMatchup.lastRoll && (
-                      <View style={styles.diceRow}>
-                        <View style={styles.die}>
-                          <Text style={styles.dieText}>{activeMatchup.lastRoll.d1}</Text>
-                        </View>
-                        <View style={styles.die}>
-                          <Text style={styles.dieText}>{activeMatchup.lastRoll.d2}</Text>
-                        </View>
-                        <Text
-                          style={[
-                            styles.outcomeBadge,
-                            activeMatchup.lastRoll.outcome === 'WIN'
-                              ? styles.winColor
-                              : activeMatchup.lastRoll.outcome === 'LOSS'
-                              ? styles.lossColor
-                              : styles.passColor,
-                          ]}
-                        >
-                          {activeMatchup.lastRoll.outcome}
-                        </Text>
-                      </View>
-                    )}
                   </>
                 ) : (
                   <Text style={styles.waitingText}>
@@ -73,6 +99,55 @@ export default function CircularTable({
                       ? `Proposed Stake: ${pendingMatchup.proposedStake} 🪙`
                       : 'Propose a fresh bet'}
                   </Text>
+                )}
+
+                {/* Synchronized Rolling / Result Dice Display */}
+                {(isRolling || rollToDisplay) && (
+                  <View style={styles.diceRow}>
+                    <Animated.View
+                      style={[
+                        styles.die,
+                        isRolling && {
+                          transform: [{ rotate: spin1 }, { scale: scaleAnim }],
+                        },
+                      ]}
+                    >
+                      <Text style={styles.dieText}>
+                        {isRolling ? rollingD1 : rollToDisplay.d1}
+                      </Text>
+                    </Animated.View>
+                    <Animated.View
+                      style={[
+                        styles.die,
+                        isRolling && {
+                          transform: [{ rotate: spin2 }, { scale: scaleAnim }],
+                        },
+                      ]}
+                    >
+                      <Text style={styles.dieText}>
+                        {isRolling ? rollingD2 : rollToDisplay.d2}
+                      </Text>
+                    </Animated.View>
+                    {!isRolling && rollToDisplay?.outcome && (
+                      <Text
+                        style={[
+                          styles.outcomeBadge,
+                          rollToDisplay.outcome === 'WIN'
+                            ? styles.winColor
+                            : rollToDisplay.outcome === 'LOSS'
+                            ? styles.lossColor
+                            : styles.passColor,
+                        ]}
+                      >
+                        {rollToDisplay.outcome}
+                      </Text>
+                    )}
+                    {isRolling && (
+                      <Text style={[styles.outcomeBadge, styles.rollingBadge]}>
+                        ROLLING...
+                      </Text>
+                    )}
+                  </View>
                 )}
               </>
             ) : (
@@ -138,7 +213,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 16,
   },
-  centerBox: { alignItems: 'center', justifyContent: 'center', maxWidth: 185 },
+  centerBox: { alignItems: 'center', justifyContent: 'center', maxWidth: 195 },
   matchupLabel: { color: '#F3F4F6', fontWeight: '700', fontSize: 13, textAlign: 'center' },
   potText: { color: '#D4AF37', fontWeight: '800', fontSize: 15, marginTop: 4 },
   turnText: { color: '#10B981', fontWeight: '600', fontSize: 12, marginTop: 2, textAlign: 'center' },
@@ -146,12 +221,25 @@ const styles = StyleSheet.create({
   countdownPill: { backgroundColor: 'rgba(239,68,68,0.22)', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, marginTop: 6 },
   countdownText: { color: '#FCA5A5', fontSize: 11, fontWeight: '700' },
   diceRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 },
-  die: { width: 32, height: 32, borderRadius: 6, backgroundColor: '#F9FAFB', alignItems: 'center', justifyContent: 'center' },
-  dieText: { color: '#111827', fontWeight: '900', fontSize: 16 },
+  die: {
+    width: 34,
+    height: 34,
+    borderRadius: 7,
+    backgroundColor: '#F9FAFB',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.35,
+    shadowRadius: 3,
+  },
+  dieText: { color: '#111827', fontWeight: '900', fontSize: 17 },
   outcomeBadge: { fontWeight: '800', fontSize: 12 },
   winColor: { color: '#10B981' },
   lossColor: { color: '#EF4444' },
   passColor: { color: '#FBBF24' },
+  rollingBadge: { color: '#D4AF37', fontStyle: 'italic' },
   seatCard: {
     position: 'absolute',
     width: 80,

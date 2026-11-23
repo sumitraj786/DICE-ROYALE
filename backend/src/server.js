@@ -9,7 +9,15 @@ const jwt = require('jsonwebtoken');
 const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
 
-const { db, reserveStakesTx, settleMatchupTx, adminAdjustWalletTx } = require('./db');
+const {
+  db,
+  reserveStakesTx,
+  settleMatchupTx,
+  adminAdjustWalletTx,
+  requestWithdrawalTx,
+  approveWithdrawalTx,
+  rejectWithdrawalTx,
+} = require('./db');
 const { rollTwoDiceSecure, getNextMatchupAfterResult } = require('./gameEngine');
 
 const PORT = process.env.PORT || 4000;
@@ -32,11 +40,15 @@ function authenticateToken(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Authentication required' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, login_id, display_name, role, status, must_change_password, available_balance, reserved_balance, avatar_color FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT id, login_id, display_name, role, status, must_change_password, available_balance, reserved_balance, avatar_color, active_session_id FROM users WHERE id = ?').get(payload.userId);
     if (!user || user.status !== 'active') {
       return res.status(403).json({ error: 'Account disabled or not found' });
     }
+    if (payload.sessionId && user.active_session_id && payload.sessionId !== user.active_session_id) {
+      return res.status(401).json({ error: 'Session expired: logged in from another device', code: 'SESSION_REVOKED' });
+    }
     req.user = user;
+    req.sessionId = payload.sessionId;
     next();
   } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });
@@ -69,12 +81,26 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   const sessionId = uuidv4();
+
+  // If user already has open Socket.IO connections from an older session, emit session:force_logout and disconnect them immediately
+  const existingSockets = userSockets.get(user.id);
+  if (existingSockets && existingSockets.size > 0) {
+    for (const socketId of existingSockets) {
+      const s = io.sockets.sockets.get(socketId);
+      if (s) {
+        s.emit('session:force_logout', { message: 'You were logged out because your account signed in on another device.' });
+        s.disconnect(true);
+      }
+    }
+    userSockets.delete(user.id);
+  }
+
   db.prepare(`
     INSERT INTO login_logs (id, user_id, status, ip_address)
     VALUES (?, ?, 'online', ?)
   `).run(sessionId, user.id, req.ip || 'unknown');
 
-  db.prepare("UPDATE users SET is_online = 1, last_activity = datetime('now') WHERE id = ?").run(user.id);
+  db.prepare("UPDATE users SET is_online = 1, active_session_id = ?, last_activity = datetime('now') WHERE id = ?").run(sessionId, user.id);
 
   const token = jwt.sign({ userId: user.id, role: user.role, sessionId }, JWT_SECRET, { expiresIn: '24h' });
   return res.json({
@@ -133,6 +159,32 @@ app.get('/api/me/history', authenticateToken, (req, res) => {
   `).all(req.user.id);
 
   res.json({ matchups, transactions });
+});
+
+// ==================== WITHDRAWAL ROUTES (PLAYER) ====================
+app.post('/api/withdrawals', authenticateToken, (req, res) => {
+  const { amount, note } = req.body || {};
+  const amt = parseInt(amount, 10);
+  if (isNaN(amt) || amt <= 0) {
+    return res.status(400).json({ error: 'Withdrawal amount must be a positive integer' });
+  }
+  try {
+    const result = requestWithdrawalTx(req.user.id, amt, note);
+    broadcastPlayerBalanceUpdate(req.user.id);
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/api/withdrawals/me', authenticateToken, (req, res) => {
+  const withdrawals = db.prepare(`
+    SELECT id, amount, note, status, admin_reason, created_at, processed_at
+    FROM withdrawal_requests
+    WHERE user_id = ?
+    ORDER BY created_at DESC LIMIT 50
+  `).all(req.user.id);
+  res.json(withdrawals);
 });
 
 // ==================== LOBBY & ROOMS ====================
@@ -278,6 +330,50 @@ app.post('/api/admin/wallet/adjust', authenticateToken, requireAdmin, (req, res)
   }
 });
 
+// ==================== WITHDRAWAL ROUTES (ADMIN) ====================
+app.get('/api/admin/withdrawals', authenticateToken, requireAdmin, (req, res) => {
+  const { status } = req.query || {};
+  let sql = `
+    SELECT w.*, u.display_name, u.login_id, adm.display_name as admin_name
+    FROM withdrawal_requests w
+    JOIN users u ON w.user_id = u.id
+    LEFT JOIN users adm ON w.admin_id = adm.id
+  `;
+  const params = [];
+  if (status && ['pending', 'approved', 'rejected'].includes(status)) {
+    sql += ' WHERE w.status = ?';
+    params.push(status);
+  }
+  sql += ' ORDER BY w.created_at DESC LIMIT 200';
+  const rows = db.prepare(sql).all(...params);
+  res.json(rows);
+});
+
+app.post('/api/admin/withdrawals/:id/approve', authenticateToken, requireAdmin, (req, res) => {
+  const { reason } = req.body || {};
+  try {
+    const result = approveWithdrawalTx(req.user.id, req.params.id, reason);
+    broadcastPlayerBalanceUpdate(result.userId);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/withdrawals/:id/reject', authenticateToken, requireAdmin, (req, res) => {
+  const { reason } = req.body || {};
+  if (!reason || !String(reason).trim()) {
+    return res.status(400).json({ error: 'Rejection reason is mandatory' });
+  }
+  try {
+    const result = rejectWithdrawalTx(req.user.id, req.params.id, reason);
+    broadcastPlayerBalanceUpdate(result.userId);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.get('/api/admin/transactions', authenticateToken, requireAdmin, (_req, res) => {
   const rows = db.prepare(`
     SELECT t.*, u.login_id, u.display_name
@@ -351,6 +447,8 @@ const io = new Server(server, {
 // In-memory live room state (backed by SQLite for all persistent balances/matchups/rolls)
 const roomStates = new Map();
 const userSockets = new Map(); // userId -> Set<socketId>
+const userDisconnectTimestamps = new Map(); // userId -> number (ms)
+const waitingEvictionTimers = new Map(); // `${roomId}:${userId}` -> NodeJS.Timeout
 
 function getOrCreateRoomState(roomId) {
   if (!roomStates.has(roomId)) {
@@ -512,6 +610,20 @@ function executeTurnRoll(roomId, playerId, isAutoRoll = false) {
 
   state.activeMatchup = null;
 
+  // Evict any matchup participant who has been offline for >= 10s (finish 1 active bet first)
+  const matchupPlayerIds = [m.playerAId, m.playerBId];
+  for (const pid of matchupPlayerIds) {
+    const dcTime = userDisconnectTimestamps.get(pid);
+    const u = db.prepare('SELECT is_online, display_name FROM users WHERE id = ?').get(pid);
+    const isOffline = !u || u.is_online === 0;
+    if (isOffline && dcTime && (Date.now() - dcTime >= DISCONNECT_COUNTDOWN_MS)) {
+      state.seats = state.seats.filter((s) => s.playerId !== pid).map((s, idx) => ({ ...s, seatIndex: idx }));
+      io.to(`room:${roomId}`).emit('table:notice', {
+        message: `${u ? u.display_name : 'Player'} auto-exited table after completing active bet while offline.`,
+      });
+    }
+  }
+
   // Setup next matchup via Circular Turn Rotation (fresh bet required!)
   const next = getNextMatchupAfterResult(state.seats, winnerId, loserId, state.room.rotation_direction);
   if (next) {
@@ -521,6 +633,8 @@ function executeTurnRoll(roomId, playerId, isAutoRoll = false) {
       proposedStake: null,
       acceptedBy: new Set(),
     };
+  } else {
+    state.pendingMatchup = null;
   }
   broadcastRoom(roomId);
 }
@@ -530,8 +644,11 @@ io.use((socket, next) => {
   if (!token) return next(new Error('Authentication required'));
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, login_id, display_name, role, status FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT id, login_id, display_name, role, status, active_session_id FROM users WHERE id = ?').get(payload.userId);
     if (!user || user.status !== 'active') return next(new Error('Account disabled'));
+    if (payload.sessionId && user.active_session_id && payload.sessionId !== user.active_session_id) {
+      return next(new Error('Session revoked: logged in from another device'));
+    }
     socket.user = user;
     socket.sessionId = payload.sessionId;
     next();
@@ -544,6 +661,14 @@ io.on('connection', (socket) => {
   const userId = socket.user.id;
   if (!userSockets.has(userId)) userSockets.set(userId, new Set());
   userSockets.get(userId).add(socket.id);
+
+  userDisconnectTimestamps.delete(userId);
+  for (const [key, timer] of waitingEvictionTimers.entries()) {
+    if (key.endsWith(`:${userId}`)) {
+      clearTimeout(timer);
+      waitingEvictionTimers.delete(key);
+    }
+  }
 
   db.prepare("UPDATE users SET is_online = 1, last_activity = datetime('now') WHERE id = ?").run(userId);
   if (socket.user.role === 'admin') {
@@ -589,6 +714,11 @@ io.on('connection', (socket) => {
   });
 
   socket.on('room:leave', ({ roomId }) => {
+    const waitKey = `${roomId}:${userId}`;
+    if (waitingEvictionTimers.has(waitKey)) {
+      clearTimeout(waitingEvictionTimers.get(waitKey));
+      waitingEvictionTimers.delete(waitKey);
+    }
     const state = roomStates.get(roomId);
     if (!state) return;
     if (state.activeMatchup && (state.activeMatchup.playerAId === userId || state.activeMatchup.playerBId === userId)) {
@@ -687,6 +817,7 @@ io.on('connection', (socket) => {
       sockets.delete(socket.id);
       if (sockets.size === 0) {
         userSockets.delete(userId);
+        userDisconnectTimestamps.set(userId, Date.now());
         db.prepare("UPDATE users SET is_online = 0, last_activity = datetime('now') WHERE id = ?").run(userId);
         const logStatus = reason === 'client namespace disconnect' ? 'logged_out' : 'unexpected_disconnect';
         if (socket.sessionId) {
@@ -698,11 +829,45 @@ io.on('connection', (socket) => {
           `).run(logStatus, socket.sessionId);
         }
 
-        // Trigger 10-second auto-roll countdown if it is this player's turn in an active matchup
+        // Handle offline players across rooms
         for (const [roomId, state] of roomStates.entries()) {
           if (state.seats.some((s) => s.playerId === userId)) {
             broadcastRoom(roomId);
-            scheduleDisconnectAutoRollIfNeeded(roomId);
+            if (state.activeMatchup) {
+              // Complete 1 active bet first: auto-roll if it is their turn
+              scheduleDisconnectAutoRollIfNeeded(roomId);
+            } else {
+              // Outside active matchup: auto-exit after 10 seconds offline
+              const waitKey = `${roomId}:${userId}`;
+              if (waitingEvictionTimers.has(waitKey)) {
+                clearTimeout(waitingEvictionTimers.get(waitKey));
+              }
+              const timer = setTimeout(() => {
+                waitingEvictionTimers.delete(waitKey);
+                const u = db.prepare('SELECT is_online, display_name FROM users WHERE id = ?').get(userId);
+                if (!u || u.is_online === 0) {
+                  const rState = roomStates.get(roomId);
+                  if (rState && !rState.activeMatchup && rState.seats.some((s) => s.playerId === userId)) {
+                    rState.seats = rState.seats.filter((s) => s.playerId !== userId).map((s, idx) => ({ ...s, seatIndex: idx }));
+                    if (rState.pendingMatchup && (rState.pendingMatchup.playerAId === userId || rState.pendingMatchup.playerBId === userId)) {
+                      rState.pendingMatchup = rState.seats.length >= 2 ? {
+                        playerAId: rState.seats[0].playerId,
+                        playerBId: rState.seats[1].playerId,
+                        firstTurnPlayerId: rState.seats[0].playerId,
+                        proposedBy: null,
+                        proposedStake: null,
+                        acceptedBy: new Set(),
+                      } : null;
+                    }
+                    io.to(`room:${roomId}`).emit('table:notice', {
+                      message: `${u ? u.display_name : 'Player'} auto-exited table after staying offline for 10 seconds.`,
+                    });
+                    broadcastRoom(roomId);
+                  }
+                }
+              }, DISCONNECT_COUNTDOWN_MS);
+              waitingEvictionTimers.set(waitKey, timer);
+            }
           }
         }
       }

@@ -59,4 +59,5 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: upp
 .badge-online { background: rgba(16,185,129,0.18); color: var(--emerald); }
 .badge-offline { background: rgba(156,163,175,0.15); color: var(--muted); }
 .badge-danger { background: rgba(239,68,68,0.18); color: var(--danger); }
+.badge-warning { background: rgba(212,175,55,0.18); color: var(--gold); }
 .form-grid { max-width: 480px; }

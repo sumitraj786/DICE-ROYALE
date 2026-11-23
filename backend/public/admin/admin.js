@@ -5,6 +5,7 @@ const titles = {
   'dashboard': 'Dashboard',
   'players': 'Players',
   'create-player': 'Create Player',
+  'withdrawals': 'Withdrawals',
   'online-users': 'Online Users',
   'game-tables': 'Game Tables',
   'bets-games': 'Bets and Games',
@@ -150,6 +151,42 @@ async function renderTab(tab) {
           msg.style.color = '#ef4444';
         }
       });
+    } else if (tab === 'withdrawals') {
+      const withdrawals = await api('/api/admin/withdrawals');
+      window.allWithdrawals = withdrawals;
+      container.innerHTML = `
+        <div class="panel">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
+            <h3>Coin Withdrawal Requests</h3>
+            <div>
+              <label style="display:inline;margin-right:8px;font-size:12px;">Filter Status:</label>
+              <select id="w-filter" style="width:auto;display:inline-block;padding:6px 10px;" onchange="filterWithdrawals(this.value)">
+                <option value="all">All Statuses</option>
+                <option value="pending">Pending</option>
+                <option value="approved">Approved</option>
+                <option value="rejected">Rejected</option>
+              </select>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Player</th>
+                <th>Login ID</th>
+                <th>Amount</th>
+                <th>Player Note</th>
+                <th>Status</th>
+                <th>Requested At</th>
+                <th>Processed At</th>
+                <th>Admin Reason</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="w-tbody">
+              ${renderWithdrawalRows(withdrawals)}
+            </tbody>
+          </table>
+        </div>`;
     } else if (tab === 'online-users' || tab === 'login-logs') {
       const logs = await api('/api/admin/online-users');
       container.innerHTML = `
@@ -286,6 +323,75 @@ window.resetPlayerPass = async (id) => {
   if (!temporaryPassword) return;
   await api(`/api/admin/players/${id}/reset-password`, { method: 'POST', body: JSON.stringify({ temporaryPassword }) });
   alert('Temporary password reset.');
+};
+
+function renderWithdrawalRows(list) {
+  if (!list || list.length === 0) {
+    return '<tr><td colspan="9" class="muted" style="text-align:center;padding:24px;">No withdrawal requests found.</td></tr>';
+  }
+  return list.map(w => `
+    <tr>
+      <td><strong>${w.display_name}</strong></td>
+      <td>${w.login_id}</td>
+      <td class="gold" style="font-weight:700;">${w.amount} 🪙</td>
+      <td>${w.note ? w.note : '<span class="muted">-</span>'}</td>
+      <td>
+        <span class="badge ${w.status === 'pending' ? 'badge-warning' : w.status === 'approved' ? 'badge-online' : 'badge-danger'}">
+          ${w.status.toUpperCase()}
+        </span>
+      </td>
+      <td>${w.created_at}</td>
+      <td>${w.processed_at ? `${w.processed_at} (${w.admin_name || 'Admin'})` : '<span class="muted">-</span>'}</td>
+      <td>${w.admin_reason ? w.admin_reason : '<span class="muted">-</span>'}</td>
+      <td>
+        ${w.status === 'pending' ? `
+          <button class="btn-sm" style="background:#10b981;color:#05120d;font-weight:700;margin-right:6px;" onclick="approveWithdrawal('${w.id}')">Approve</button>
+          <button class="btn-sm btn-danger" onclick="rejectWithdrawal('${w.id}')">Reject</button>
+        ` : `<span class="muted">Processed</span>`}
+      </td>
+    </tr>
+  `).join('');
+}
+
+window.filterWithdrawals = (status) => {
+  const tbody = document.getElementById('w-tbody');
+  if (!tbody || !window.allWithdrawals) return;
+  const filtered = status === 'all' ? window.allWithdrawals : window.allWithdrawals.filter(w => w.status === status);
+  tbody.innerHTML = renderWithdrawalRows(filtered);
+};
+
+window.approveWithdrawal = async (id) => {
+  const reason = prompt('Optional approval note (or press OK to confirm):', 'Approved');
+  if (reason === null) return;
+  try {
+    await api(`/api/admin/withdrawals/${id}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: reason || 'Approved' }),
+    });
+    alert('Withdrawal request approved successfully.');
+    renderTab('withdrawals');
+  } catch (err) {
+    alert('Approval failed: ' + err.message);
+  }
+};
+
+window.rejectWithdrawal = async (id) => {
+  const reason = prompt('Mandatory rejection reason (coins will be refunded to player):');
+  if (reason === null) return;
+  if (!reason.trim()) {
+    alert('A reason is mandatory to reject a withdrawal.');
+    return;
+  }
+  try {
+    await api(`/api/admin/withdrawals/${id}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: reason.trim() }),
+    });
+    alert('Withdrawal request rejected. Coins refunded to player.');
+    renderTab('withdrawals');
+  } catch (err) {
+    alert('Rejection failed: ' + err.message);
+  }
 };
 
 if (token) showApp();

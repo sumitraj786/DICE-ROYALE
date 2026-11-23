@@ -4,7 +4,13 @@
     "slug": "dice-royale",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B0F0E"
+    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.diceroyale.app"
@@ -12,11 +18,18 @@
     "android": {
       "package": "com.diceroyale.app",
       "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0B291E"
       }
     },
     "web": {
       "bundler": "metro"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "1dfbbc3c-e39e-4846-9a11-901a8af3d9c1"
+      }
+    },
+    "owner": "johncenaxxx082"
   }
 }

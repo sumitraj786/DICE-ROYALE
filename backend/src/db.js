@@ -32,6 +32,7 @@ function initSchema() {
       total_won INTEGER NOT NULL DEFAULT 0,
       total_lost INTEGER NOT NULL DEFAULT 0,
       is_online INTEGER NOT NULL DEFAULT 0,
+      active_session_id TEXT,
       last_activity TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -117,7 +118,26 @@ function initSchema() {
       metadata TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS withdrawal_requests (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      note TEXT,
+      status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'approved' | 'rejected'
+      admin_id TEXT,
+      admin_reason TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      processed_at TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
   `);
+
+  // Safe migration check for existing databases
+  const userColumns = db.prepare("PRAGMA table_info(users)").all();
+  if (!userColumns.some((c) => c.name === 'active_session_id')) {
+    db.exec("ALTER TABLE users ADD COLUMN active_session_id TEXT;");
+  }
 }
 
 function seedDefaults() {
@@ -247,6 +267,116 @@ const adminAdjustWalletTx = db.transaction((adminId, targetUserId, delta, reason
   return { txId, afterAvail };
 });
 
+// Atomic player withdrawal request: moves amount from available to reserved
+const requestWithdrawalTx = db.transaction((userId, amount, note) => {
+  if (!Number.isInteger(amount) || amount <= 0) {
+    throw new Error('Withdrawal amount must be a positive integer');
+  }
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user) throw new Error('Player not found');
+  if (user.status !== 'active') throw new Error('Account is not active');
+  if (user.available_balance < amount) {
+    throw new Error(`Insufficient available balance (Available: ${user.available_balance} 🪙)`);
+  }
+
+  const afterAvail = user.available_balance - amount;
+  const afterRes = user.reserved_balance + amount;
+
+  db.prepare(`
+    UPDATE users SET available_balance = ?, reserved_balance = ?
+    WHERE id = ?
+  `).run(afterAvail, afterRes, user.id);
+
+  const reqId = uuidv4();
+  db.prepare(`
+    INSERT INTO withdrawal_requests (id, user_id, amount, note, status)
+    VALUES (?, ?, ?, ?, 'pending')
+  `).run(reqId, user.id, amount, note ? String(note).trim() : null);
+
+  const txId = uuidv4();
+  db.prepare(`
+    INSERT INTO transactions (id, user_id, type, amount, before_available, after_available, before_reserved, after_reserved, reason, reference_id)
+    VALUES (?, ?, 'withdrawal_request', ?, ?, ?, ?, ?, ?, ?)
+  `).run(txId, user.id, -amount, user.available_balance, afterAvail, user.reserved_balance, afterRes, note ? `Withdrawal requested: ${note}` : 'Coin withdrawal request', reqId);
+
+  return { id: reqId, amount, afterAvail, afterRes, status: 'pending' };
+});
+
+// Atomic admin withdrawal approval: deducts reserved balance, marks approved
+const approveWithdrawalTx = db.transaction((adminId, requestId, adminReason) => {
+  const req = db.prepare('SELECT * FROM withdrawal_requests WHERE id = ?').get(requestId);
+  if (!req) throw new Error('Withdrawal request not found');
+  if (req.status !== 'pending') throw new Error(`Withdrawal request is already ${req.status}`);
+
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user_id);
+  if (!user) throw new Error('Player not found');
+
+  const afterRes = Math.max(0, user.reserved_balance - req.amount);
+
+  db.prepare(`
+    UPDATE users SET reserved_balance = ? WHERE id = ?
+  `).run(afterRes, user.id);
+
+  db.prepare(`
+    UPDATE withdrawal_requests
+    SET status = 'approved', admin_id = ?, admin_reason = ?, processed_at = datetime('now')
+    WHERE id = ?
+  `).run(adminId, adminReason ? String(adminReason).trim() : 'Approved by admin', req.id);
+
+  const txId = uuidv4();
+  db.prepare(`
+    INSERT INTO transactions (id, user_id, type, amount, before_available, after_available, before_reserved, after_reserved, reason, reference_id, created_by)
+    VALUES (?, ?, 'withdrawal_approved', ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(txId, user.id, -req.amount, user.available_balance, user.available_balance, user.reserved_balance, afterRes, adminReason ? `Withdrawal approved: ${adminReason}` : 'Withdrawal approved by admin', req.id, adminId);
+
+  db.prepare(`
+    INSERT INTO audit_logs (id, admin_id, action, target_user_id, amount, reason, transaction_id)
+    VALUES (?, ?, 'withdrawal_approved', ?, ?, ?, ?)
+  `).run(uuidv4(), adminId, user.id, req.amount, adminReason ? String(adminReason).trim() : 'Withdrawal approved', txId);
+
+  return { id: req.id, userId: user.id, amount: req.amount, status: 'approved' };
+});
+
+// Atomic admin withdrawal rejection: refunds reserved balance back to available balance
+const rejectWithdrawalTx = db.transaction((adminId, requestId, adminReason) => {
+  if (!adminReason || !String(adminReason).trim()) {
+    throw new Error('Admin reason is mandatory for rejecting a withdrawal');
+  }
+
+  const req = db.prepare('SELECT * FROM withdrawal_requests WHERE id = ?').get(requestId);
+  if (!req) throw new Error('Withdrawal request not found');
+  if (req.status !== 'pending') throw new Error(`Withdrawal request is already ${req.status}`);
+
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user_id);
+  if (!user) throw new Error('Player not found');
+
+  const afterAvail = user.available_balance + req.amount;
+  const afterRes = Math.max(0, user.reserved_balance - req.amount);
+
+  db.prepare(`
+    UPDATE users SET available_balance = ?, reserved_balance = ? WHERE id = ?
+  `).run(afterAvail, afterRes, user.id);
+
+  db.prepare(`
+    UPDATE withdrawal_requests
+    SET status = 'rejected', admin_id = ?, admin_reason = ?, processed_at = datetime('now')
+    WHERE id = ?
+  `).run(adminId, String(adminReason).trim(), req.id);
+
+  const txId = uuidv4();
+  db.prepare(`
+    INSERT INTO transactions (id, user_id, type, amount, before_available, after_available, before_reserved, after_reserved, reason, reference_id, created_by)
+    VALUES (?, ?, 'withdrawal_rejected', ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(txId, user.id, req.amount, user.available_balance, afterAvail, user.reserved_balance, afterRes, `Withdrawal rejected: ${adminReason.trim()}`, req.id, adminId);
+
+  db.prepare(`
+    INSERT INTO audit_logs (id, admin_id, action, target_user_id, amount, reason, transaction_id)
+    VALUES (?, ?, 'withdrawal_rejected', ?, ?, ?, ?)
+  `).run(uuidv4(), adminId, user.id, req.amount, String(adminReason).trim(), txId);
+
+  return { id: req.id, userId: user.id, amount: req.amount, status: 'rejected' };
+});
+
 initSchema();
 seedDefaults();
 
@@ -255,4 +385,7 @@ module.exports = {
   reserveStakesTx,
   settleMatchupTx,
   adminAdjustWalletTx,
+  requestWithdrawalTx,
+  approveWithdrawalTx,
+  rejectWithdrawalTx,
 };
