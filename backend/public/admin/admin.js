@@ -25,15 +25,36 @@ async function api(path, opts = {}) {
       ...(opts.headers || {}),
     },
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || 'Request failed');
+  let data = {};
+  try {
+    data = await res.json();
+  } catch {
+    data = {};
+  }
+  if (!res.ok) {
+    if (res.status === 401 && path !== '/api/auth/login') {
+      localStorage.removeItem('dr_admin_token');
+      token = '';
+      showLogin(data.error || 'Your session has expired. Please sign in again.');
+    }
+    throw new Error(data.error || 'Request failed');
+  }
   return data;
+}
+
+function showLogin(msg = '') {
+  document.getElementById('app-shell').classList.add('hidden');
+  document.getElementById('login-overlay').classList.remove('hidden');
+  const errEl = document.getElementById('login-error');
+  if (errEl) errEl.textContent = msg;
 }
 
 document.getElementById('admin-login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const loginId = document.getElementById('login-id').value;
   const password = document.getElementById('login-pass').value;
+  const errEl = document.getElementById('login-error');
+  if (errEl) errEl.textContent = '';
   try {
     const res = await api('/api/auth/login', {
       method: 'POST',
@@ -44,14 +65,14 @@ document.getElementById('admin-login-form').addEventListener('submit', async (e)
     localStorage.setItem('dr_admin_token', token);
     showApp();
   } catch (err) {
-    document.getElementById('login-error').textContent = err.message;
+    if (errEl) errEl.textContent = err.message;
   }
 });
 
 document.getElementById('logout-btn').addEventListener('click', () => {
   localStorage.removeItem('dr_admin_token');
   token = '';
-  location.reload();
+  showLogin('You have been signed out.');
 });
 
 document.getElementById('refresh-btn').addEventListener('click', () => renderTab(currentTab));
@@ -309,9 +330,23 @@ async function renderTab(tab) {
       });
     }
   } catch (err) {
-    container.innerHTML = `<p class="error-text">${err.message}</p>`;
+    if (err.message && (err.message.includes('token') || err.message.includes('Session') || err.message.includes('Authentication') || err.message.includes('expired'))) {
+      container.innerHTML = `
+        <div class="panel" style="text-align:center;padding:40px;">
+          <p class="error-text" style="font-size:16px;margin-bottom:16px;">${err.message}</p>
+          <button class="btn-primary" style="display:inline-block;width:auto;padding:10px 24px;" onclick="forceAdminLogout()">Sign In Again</button>
+        </div>`;
+    } else {
+      container.innerHTML = `<p class="error-text">${err.message}</p>`;
+    }
   }
 }
+
+window.forceAdminLogout = () => {
+  localStorage.removeItem('dr_admin_token');
+  token = '';
+  showLogin('Your session has expired. Please sign in again.');
+};
 
 window.togglePlayerStatus = async (id, status) => {
   await api(`/api/admin/players/${id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) });
